@@ -1,4 +1,4 @@
-# FlashVSR worker - Serverless ComfyUI
+# FlashVSR worker - Serverless ComfyUI.
 FROM runpod/worker-comfyui:5.2.0-base
 
 # -----------------------------
