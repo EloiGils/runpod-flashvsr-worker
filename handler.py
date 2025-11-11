@@ -4,23 +4,27 @@ import time
 import uuid
 import glob
 import copy
+import subprocess
 
 import requests
-import runpod  # <--- IMPORTANTE
+import runpod
 
-
-# Config por defecto del contenedor ComfyUI
-COMFY_URL = os.getenv("COMFY_URL", "http://127.0.0.1:8188")
-COMFY_INPUT_DIR = os.getenv("COMFY_INPUT_DIR", "/comfyui/input")
-COMFY_OUTPUT_DIR = os.getenv("COMFY_OUTPUT_DIR", "/comfyui/output")
+# ---------------------------------------
+# Configuración rutas / ComfyUI
+# ---------------------------------------
+COMFY_ROOT = "/comfyui"
+COMFY_URL = "http://127.0.0.1:8188"
+COMFY_INPUT_DIR = os.path.join(COMFY_ROOT, "input")
+COMFY_OUTPUT_DIR = os.path.join(COMFY_ROOT, "output")
 WORKFLOW_TIMEOUT_SECONDS = int(os.getenv("FLASHVSR_TIMEOUT", "3600"))
 
-
-# Plantilla de tu workflow FlashVSR (API export)
+# ---------------------------------------
+# Workflow FlashVSR plantilla (API export)
+# ---------------------------------------
 FLASHVSR_WORKFLOW_TEMPLATE = {
     "1": {
         "inputs": {
-            "video": "input/Abundance_10.mp4",
+            "video": "input/placeholder.mp4",  # lo sobreescribimos
             "force_rate": 0,
             "custom_width": 0,
             "custom_height": 0,
@@ -37,8 +41,8 @@ FLASHVSR_WORKFLOW_TEMPLATE = {
     "2": {
         "inputs": {
             "model": "FlashVSR-v1.1",
-            "mode": "tiny",
-            "scale": 2,
+            "mode": "tiny",    # lo podemos cambiar por input
+            "scale": 2,        # lo podemos cambiar por input
             "tiled_vae": True,
             "tiled_dit": True,
             "unload_dit": False,
@@ -54,7 +58,7 @@ FLASHVSR_WORKFLOW_TEMPLATE = {
         "inputs": {
             "frame_rate": 30,
             "loop_count": 0,
-            "filename_prefix": "flashvsr_test",
+            "filename_prefix": "flashvsr_serverless",
             "format": "video/h264-mp4",
             "pix_fmt": "yuv420p",
             "crf": 19,
@@ -73,16 +77,57 @@ FLASHVSR_WORKFLOW_TEMPLATE = {
 }
 
 
+# ---------------------------------------
+# Utilidades
+# ---------------------------------------
+
 def _ensure_dirs():
     os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
     os.makedirs(COMFY_OUTPUT_DIR, exist_ok=True)
 
 
+def _start_comfy_if_needed():
+    """
+    Arranca ComfyUI si no está ya escuchando en 8188.
+    Solo se ejecuta una vez por contenedor.
+    """
+    if os.environ.get("COMFY_ALREADY_STARTED") == "1":
+        return
+
+    # ¿ya responde?
+    try:
+        requests.get(f"{COMFY_URL}/system_stats", timeout=2)
+        os.environ["COMFY_ALREADY_STARTED"] = "1"
+        return
+    except Exception:
+        pass
+
+    # Lanzar ComfyUI en background
+    subprocess.Popen(
+        ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"],
+        cwd=COMFY_ROOT
+    )
+
+    # Esperar a que levante
+    for _ in range(120):
+        try:
+            requests.get(f"{COMFY_URL}/system_stats", timeout=2)
+            os.environ["COMFY_ALREADY_STARTED"] = "1"
+            return
+        except Exception:
+            time.sleep(1)
+
+    raise RuntimeError("ComfyUI no arrancó correctamente.")
+
+
 def _save_video_to_input(video_name: str, video_b64: str) -> str:
-    """Guarda el vídeo base64 en /comfyui/input/<video_name>."""
+    """
+    Guarda el vídeo base64 en /comfyui/input/<video_name>
+    y devuelve la ruta absoluta.
+    """
     _ensure_dirs()
 
-    # Quitar prefijo tipo "data:video/mp4;base64,..."
+    # Si viene como "data:video/mp4;base64,AAAA..."
     if "," in video_b64:
         video_b64 = video_b64.split(",", 1)[1]
 
@@ -92,26 +137,27 @@ def _save_video_to_input(video_name: str, video_b64: str) -> str:
     with open(path, "wb") as f:
         f.write(data)
 
-    print(f"[handler] Guardado vídeo en {path}", flush=True)
     return path
 
 
 def _list_output_mp4_files():
-    """Lista todos los .mp4 en /comfyui/output."""
     pattern = os.path.join(COMFY_OUTPUT_DIR, "*.mp4")
     return glob.glob(pattern)
 
 
 def _run_workflow_in_comfyui(workflow: dict) -> str:
-    """Lanza el workflow en ComfyUI vía /prompt y espera el /history."""
+    """
+    Lanza el workflow en ComfyUI vía /prompt y espera a que
+    se complete (vía /history/<client_id>).
+    """
     client_id = str(uuid.uuid4())
     payload = {
         "client_id": client_id,
         "prompt": workflow
     }
 
-    print(f"[handler] Enviando prompt a ComfyUI, client_id={client_id}", flush=True)
-    r = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=60)
+    # Enviar prompt
+    r = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=30)
     r.raise_for_status()
 
     start = time.time()
@@ -123,7 +169,7 @@ def _run_workflow_in_comfyui(workflow: dict) -> str:
         time.sleep(5)
 
         try:
-            hr = requests.get(f"{COMFY_URL}/history/{client_id}", timeout=60)
+            hr = requests.get(f"{COMFY_URL}/history/{client_id}", timeout=30)
         except Exception:
             continue
 
@@ -137,30 +183,31 @@ def _run_workflow_in_comfyui(workflow: dict) -> str:
 
         history = data.get("history", {})
         if history:
-            print("[handler] History encontrado en ComfyUI", flush=True)
             break
 
-    # Pequeña espera para que se escriba el vídeo
+    # pequeña espera para que se escriba el vídeo
     time.sleep(5)
 
     return client_id
 
 
+# ---------------------------------------
+# Handler RunPod
+# ---------------------------------------
+
 def handler(event):
     """
-    Entrada serverless.
-
-    Espera:
+    Espera un JSON:
     {
       "input": {
-        "video_name": "Abundance_3.mp4",
-        "video_b64": "<BASE64 DEL VIDEO>",
-        "mode": "tiny",
-        "scale": 2
+        "video_name": "mi_video.mp4",
+        "video_b64": "<BASE64>",
+        "mode": "tiny" | "full" | "tiny-long",
+        "scale": 2 | 4
       }
     }
     """
-    print(f"[handler] Evento recibido: keys={list(event.keys())}", flush=True)
+    _start_comfy_if_needed()
 
     input_data = event.get("input") or {}
 
@@ -172,20 +219,24 @@ def handler(event):
     if not video_b64:
         raise ValueError("input.video_b64 es obligatorio")
 
-    # 1) Guardar vídeo
+    # 1) Guardar vídeo en /comfyui/input
     before_files = set(_list_output_mp4_files())
     video_path = _save_video_to_input(video_name, video_b64)
 
-    # 2) Construir workflow
+    # 2) Construir workflow FlashVSR a partir de la plantilla
     workflow = copy.deepcopy(FLASHVSR_WORKFLOW_TEMPLATE)
+
+    # Nodo 1: VHS_LoadVideoPath -> apuntar al vídeo que acabamos de guardar
     workflow["1"]["inputs"]["video"] = f"input/{video_name}"
+
+    # Nodo 2: FlashVSRNode -> modo y escala
     workflow["2"]["inputs"]["mode"] = mode
     workflow["2"]["inputs"]["scale"] = scale
 
-    print(f"[handler] Lanzando workflow: mode={mode}, scale={scale}", flush=True)
+    # 3) Lanzar workflow en ComfyUI
     client_id = _run_workflow_in_comfyui(workflow)
 
-    # 3) Buscar nuevo mp4 en /output
+    # 4) Buscar el nuevo mp4 generado en /comfyui/output
     after_files = set(_list_output_mp4_files())
     new_files = list(after_files - before_files)
 
@@ -198,8 +249,7 @@ def handler(event):
         with open(output_path, "rb") as f:
             output_b64 = base64.b64encode(f.read()).decode("ascii")
 
-    print(f"[handler] Finalizado. output={output_path}", flush=True)
-
+    # 5) Devolver info a n8n
     return {
         "client_id": client_id,
         "input_video_path": video_path,
@@ -210,5 +260,6 @@ def handler(event):
     }
 
 
-# *** CLAVE ***: decirle a RunPod que use esta función.
+# Arrancar loop serverless de RunPod
 runpod.serverless.start({"handler": handler})
+
