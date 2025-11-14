@@ -11,57 +11,62 @@ import runpod
 # CONFIG BÁSICA
 # -------------------------------------------------------------------
 
-# ComfyUI corre dentro del contenedor en este puerto (imagen runpod/worker-comfyui)
 COMFY_URL = os.getenv("COMFY_URL", "http://127.0.0.1:8188")
 
-# Directorios estándar de ComfyUI según los logs:
-# ** ComfyUI Path: /comfyui
-# así que el input y output son:
-COMFY_INPUT_DIR = os.getenv("COMFY_INPUT_DIR", "/comfyui/input")
-COMFY_OUTPUT_DIR = os.getenv("COMFY_OUTPUT_DIR", "/comfyui/output")
+# Raíz de ComfyUI (según logs)
+COMFY_BASE_DIR = "/comfyui"
 
-# Timeout máximo para un vídeo (en segundos)
+# Directorios:
+#  - input general: /comfyui/input
+#  - input de vídeo: /comfyui/input/video  (LO USAMOS AQUÍ)
+#  - output: /comfyui/output
+COMFY_INPUT_DIR = os.getenv("COMFY_INPUT_DIR", os.path.join(COMFY_BASE_DIR, "input"))
+COMFY_INPUT_VIDEO_DIR = os.getenv(
+    "COMFY_INPUT_VIDEO_DIR",
+    os.path.join(COMFY_INPUT_DIR, "video")
+)
+COMFY_OUTPUT_DIR = os.getenv("COMFY_OUTPUT_DIR", os.path.join(COMFY_BASE_DIR, "output"))
+
 WORKFLOW_TIMEOUT_SECONDS = int(os.getenv("FLASHVSR_TIMEOUT", "3600"))
 
 
 # -------------------------------------------------------------------
-# WORKFLOW FLASHVSR (PLANTILLA)
-#   -> Es el export API de tu grafo que ya funcionaba en el POD
+# PLANTILLA WORKFLOW FLASHVSR
 # -------------------------------------------------------------------
 
 FLASHVSR_WORKFLOW_TEMPLATE = {
     "1": {
         "inputs": {
-            # ESTE CAMPO "video" LO SOBREESCRIBIMOS EN RUNTIME
-            "video": "Abundance_10.mp4",
+            # LO SOBREESCRIBIMOS EN RUNTIME
+            "video": "video/Abundance_10.mp4",
             "force_rate": 0,
             "custom_width": 0,
             "custom_height": 0,
             "frame_load_cap": 0,
             "skip_first_frames": 0,
             "select_every_nth": 1,
-            "format": "AnimateDiff"
+            "format": "AnimateDiff",
         },
         "class_type": "VHS_LoadVideoPath",
         "_meta": {
             "title": "Load Video (Path) 🎥🅥🅗🅢"
-        }
+        },
     },
     "2": {
         "inputs": {
             "model": "FlashVSR-v1.1",
-            "mode": "tiny",        # lo sobreescribimos con input.mode
-            "scale": 2,            # lo sobreescribimos con input.scale
+            "mode": "tiny",   # lo sobreescribimos con input.mode
+            "scale": 2,       # lo sobreescribimos con input.scale
             "tiled_vae": True,
             "tiled_dit": True,
             "unload_dit": False,
             "seed": 33833989687976,
-            "frames": ["1", 0]
+            "frames": ["1", 0],
         },
         "class_type": "FlashVSRNode",
         "_meta": {
             "title": "FlashVSR Ultra-Fast"
-        }
+        },
     },
     "3": {
         "inputs": {
@@ -76,13 +81,13 @@ FLASHVSR_WORKFLOW_TEMPLATE = {
             "pingpong": False,
             "save_output": True,
             "images": ["2", 0],
-            "audio": ["1", 2]
+            "audio": ["1", 2],
         },
         "class_type": "VHS_VideoCombine",
         "_meta": {
             "title": "Video Combine 🎥🅥🅗🅢"
-        }
-    }
+        },
+    },
 }
 
 
@@ -91,29 +96,30 @@ FLASHVSR_WORKFLOW_TEMPLATE = {
 # -------------------------------------------------------------------
 
 def _ensure_dirs():
-    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+    os.makedirs(COMFY_INPUT_VIDEO_DIR, exist_ok=True)
     os.makedirs(COMFY_OUTPUT_DIR, exist_ok=True)
 
 
 def _save_video_to_input(video_name: str, video_b64: str) -> str:
     """
-    Guarda el vídeo base64 en /comfyui/input/<video_name>
+    Guarda el vídeo base64 en /comfyui/input/video/<video_name>
     y devuelve la ruta absoluta.
     """
     _ensure_dirs()
 
-    # Si viene con "data:video/mp4;base64,..." lo cortamos
+    # Quitar posible prefijo data:...
     if "," in video_b64:
         video_b64 = video_b64.split(",", 1)[1]
 
     data = base64.b64decode(video_b64)
-    path = os.path.join(COMFY_INPUT_DIR, video_name)
 
-    with open(path, "wb") as f:
+    dest_path = os.path.join(COMFY_INPUT_VIDEO_DIR, video_name)
+
+    with open(dest_path, "wb") as f:
         f.write(data)
 
-    print(f"[FlashVSR handler] Saved input video at: {path}", flush=True)
-    return path
+    print(f"[FlashVSR handler] Saved input video at: {dest_path}", flush=True)
+    return dest_path
 
 
 def _list_output_mp4_files():
@@ -121,38 +127,33 @@ def _list_output_mp4_files():
     Lista todos los mp4 en el directorio de salida de ComfyUI.
     """
     pattern = os.path.join(COMFY_OUTPUT_DIR, "*.mp4")
-    files = glob.glob(pattern)
-    return files
+    return glob.glob(pattern)
 
 
 def _run_workflow_in_comfyui(workflow: dict) -> str:
     """
     Lanza el workflow en ComfyUI vía /prompt y espera
     a que se complete usando /history/<client_id>.
-    LOGUEAMOS la respuesta de /prompt para ver por qué devuelve 400.
     """
     client_id = str(uuid.uuid4())
 
     payload = {
         "client_id": client_id,
-        "prompt": workflow
+        "prompt": workflow,
     }
 
     print(f"[FlashVSR handler] Sending prompt to ComfyUI, client_id={client_id}", flush=True)
 
-    # Enviar prompt
-    try:
-        r = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=60)
+    r = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=60)
+
+    # Log de depuración si Comfy devuelve error
+    if not r.ok:
         print(f"[FlashVSR handler] /prompt status={r.status_code}", flush=True)
         try:
-            print("[FlashVSR handler] /prompt response text:", r.text[:2000], flush=True)
+            print(f"[FlashVSR handler] /prompt response: {r.json()}", flush=True)
         except Exception:
-            pass
+            print(f"[FlashVSR handler] /prompt response text: {r.text}", flush=True)
         r.raise_for_status()
-    except Exception as e:
-        print(f"[FlashVSR handler] ERROR calling /prompt: {e}", flush=True)
-        # Re-lanzamos para que RunPod marque el job como FAILED
-        raise
 
     start = time.time()
 
@@ -180,17 +181,17 @@ def _run_workflow_in_comfyui(workflow: dict) -> str:
 
         history = data.get("history", {})
         if history:
-            print(f"[FlashVSR handler] Workflow finished in ComfyUI (history found).", flush=True)
+            print("[FlashVSR handler] Workflow finished in ComfyUI (history found).", flush=True)
             break
 
-    # Espera extra a que el vídeo se escriba a disco
+    # Pequeña espera extra para asegurarnos de que el vídeo está en disco
     time.sleep(5)
 
     return client_id
 
 
 # -------------------------------------------------------------------
-# HANDLER PRINCIPAL (lo que llama RunPod)
+# HANDLER PRINCIPAL
 # -------------------------------------------------------------------
 
 def handler(event):
@@ -223,23 +224,23 @@ def handler(event):
 
     print(f"[FlashVSR handler] video_name={video_name}, mode={mode}, scale={scale}", flush=True)
 
-    # 1) Guardar vídeo en /comfyui/input
+    # 1) Guardar vídeo en /comfyui/input/video
     before_files = set(_list_output_mp4_files())
     video_path = _save_video_to_input(video_name, video_b64)
 
     # 2) Construir workflow desde la plantilla
     workflow = copy.deepcopy(FLASHVSR_WORKFLOW_TEMPLATE)
 
-    # >>> CLAVE: VHS_LoadVideoPath espera un path RELATIVO al directorio de input de ComfyUI.
-    # El input_dir de ComfyUI es "input", y nosotros guardamos en /comfyui/input/<video_name>.
-    # Por tanto, aquí solo ponemos el nombre del archivo, SIN "input/" delante.
-    workflow["1"]["inputs"]["video"] = video_name
+    # VHS_LoadVideoPath espera una ruta RELATIVA al directorio "input"
+    # y anotada como tipo "video", o sea: "video/<nombre>"
+    relative_video_path = f"video/{video_name}"
+    workflow["1"]["inputs"]["video"] = relative_video_path
 
     # FlashVSRNode: modo (tiny/full/tiny-long) y escala (2/3/4)
     workflow["2"]["inputs"]["mode"] = mode
     workflow["2"]["inputs"]["scale"] = scale
 
-    print(f"[FlashVSR handler] Workflow video field set to: {workflow['1']['inputs']['video']}", flush=True)
+    print(f"[FlashVSR handler] Workflow Node1.video = {relative_video_path}", flush=True)
 
     # 3) Ejecutar workflow en ComfyUI
     client_id = _run_workflow_in_comfyui(workflow)
@@ -268,7 +269,7 @@ def handler(event):
         "output_video_path": output_path,
         "output_video_b64": output_b64,
         "mode": mode,
-        "scale": scale
+        "scale": scale,
     }
 
 
